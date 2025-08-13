@@ -19,6 +19,7 @@
 #include "help.hpp"
 #include "precomp.hpp"
 #include "types.hpp"
+#include "SpeedSample.hpp"
 
 // Kernel prototypes (defined in cuda_kernels.cu)
 extern "C" {
@@ -87,7 +88,7 @@ static std::string toHex(const uint8_t *s, size_t len) {
 }
 
 struct DeviceCtx {
-    explicit DeviceCtx(const Mode &m) : mode(m) {}
+    explicit DeviceCtx(const Mode &m) : mode(m), speed(20) {}
     int devId = 0;
     uint32_t index = 0;
     uint32_t worksizeLocal = 256; // unused in CUDA path
@@ -109,13 +110,18 @@ struct DeviceCtx {
     uint8_t localScoreMax = 0;
     std::chrono::time_point<std::chrono::steady_clock> start;
     uint64_t rounds = 0;
+    SpeedSample speed;
 };
 
 static std::mutex g_printMutex;
 static std::atomic<uint8_t> g_globalScoreMax{0};
 static std::atomic<bool> g_quit{false};
+static std::mutex g_speedMutex;
+static std::vector<double> g_gpuSpeeds;
+static unsigned g_speedTick = 0;
+static unsigned g_deviceCount = 0;
 
-static void printFinding(const ulonglong4 &seed, uint64_t round, const result &r, uint8_t score, const std::chrono::time_point<std::chrono::steady_clock> &timeStart, const Mode &mode) {
+static void printFinding(int gpuIndex, const ulonglong4 &seed, uint64_t round, const result &r, uint8_t score, const std::chrono::time_point<std::chrono::steady_clock> &timeStart, const Mode &mode) {
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - timeStart).count();
     uint64_t s0 = seed.x + round; uint64_t carry = (s0 < seed.x) ? 1 : 0;
     uint64_t s1 = seed.y + carry; carry = (s1 < carry) ? 1 : 0;
@@ -127,7 +133,8 @@ static void printFinding(const ulonglong4 &seed, uint64_t round, const result &r
     std::string pub = toHex(r.foundHash, 20);
     std::lock_guard<std::mutex> lk(g_printMutex);
     std::cout << "\33[2K\r  Time: " << std::setw(5) << seconds << "s Score: " << std::setw(2) << (int)score
-              << " Private: 0x" << priv << ' ' << mode.transformName() << ": 0x" << pub << std::endl;
+              << " Private: 0x" << priv << ' ' << mode.transformName() << ": 0x" << pub
+              << " (GPU" << gpuIndex << ")" << std::endl;
 }
 
 static void deviceThread(DeviceCtx ctx) {
@@ -188,6 +195,27 @@ static void deviceThread(DeviceCtx ctx) {
         cudaStreamSynchronize(ctx.stream);
         ++ctx.rounds;
 
+        // Update per-GPU speed and print totals periodically
+        ctx.speed.sample(static_cast<double>(ctx.sizeTotal));
+        {
+            std::lock_guard<std::mutex> lk(g_speedMutex);
+            g_gpuSpeeds[ctx.index] = ctx.speed.getSpeed();
+            if (++g_speedTick >= g_deviceCount) {
+                g_speedTick = 0;
+                double total = 0.0;
+                std::ostringstream ss;
+                ss.setf(std::ios::fixed); ss << std::setprecision(1);
+                for (unsigned i = 0; i < g_deviceCount; ++i) {
+                    double mh = g_gpuSpeeds[i] / 1e6;
+                    total += g_gpuSpeeds[i];
+                    ss << " GPU" << i << ": " << mh << " MH/s";
+                }
+                double mht = total / 1e6;
+                std::lock_guard<std::mutex> pk(g_printMutex);
+                std::cout << "\33[2K\r  Total: " << std::setprecision(1) << mht << " MH/s" << ss.str() << std::flush;
+            }
+        }
+
         for (int i = PROFANITY_MAX_SCORE; i > ctx.localScoreMax; --i) {
             result &r = ctx.h_result[i];
             if (r.found > 0 && i >= ctx.localScoreMax) {
@@ -195,7 +223,7 @@ static void deviceThread(DeviceCtx ctx) {
                 uint8_t globalPrev = g_globalScoreMax.load();
                 if (i > globalPrev) {
                     g_globalScoreMax.store(i);
-                    printFinding(ctx.seed, ctx.rounds, r, (uint8_t)i, ctx.start, ctx.mode);
+                    printFinding(ctx.index, ctx.seed, ctx.rounds, r, (uint8_t)i, ctx.start, ctx.mode);
                 }
                 break;
             }
@@ -273,6 +301,9 @@ int main(int argc, char **argv) {
         }
         if (devices.empty()) return 1;
 
+        g_deviceCount = static_cast<unsigned>(devices.size());
+        g_gpuSpeeds.assign(g_deviceCount, 0.0);
+
         const uint32_t invSize = (uint32_t)std::min<size_t>(inverseSize, 255);
         const uint32_t sizeTotal = (uint32_t)std::min<size_t>(worksizeMax == 0 ? inverseSize * inverseMultiple : worksizeMax, 0xFFFFFFFFu);
 
@@ -305,4 +336,3 @@ int main(int argc, char **argv) {
         std::cout << "unknown exception occurred" << std::endl; return 1;
     }
 }
-

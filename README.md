@@ -108,6 +108,7 @@ usage: ./profanity2 [OPTIONS]
       - Uses a secure per-device 256-bit seed sourced from /dev/urandom.
       - Supports inverse-size up to 255 (default). The work size is set automatically.
       - Multi-GPU: spawns one worker thread per GPU and avoids host-side blocking.
+      - Displays per-GPU and total hashrate (MH/s). When a hit is found, the log includes which GPU found it.
 
   Forked "profanity2":
     Author: 1inch Network <info@1inch.io>
