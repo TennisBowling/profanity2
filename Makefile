@@ -27,7 +27,7 @@ clean:
 	rm -rf *.o
 
 # CUDA build (optional)
-CUDA_HOST_SOURCES=Mode.cpp precomp.cpp
+CUDA_HOST_SOURCES=Mode.cpp precomp.cpp SpeedSample.cpp
 CUDA_DEVICE_SOURCES=profanity_cuda.cu cuda_kernels.cu
 CUDA_OBJECTS_HOST=$(CUDA_HOST_SOURCES:.cpp=.o)
 CUDA_OBJECTS_DEVICE=$(CUDA_DEVICE_SOURCES:.cu=.o)
