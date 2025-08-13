@@ -120,6 +120,7 @@ static std::mutex g_speedMutex;
 static std::vector<double> g_gpuSpeeds;
 static std::vector<double> g_gpuLastNonZero;
 static std::vector<uint64_t> g_gpuLastUpdateMs;
+static std::vector<uint64_t> g_gpuProcessed; // cumulative points processed
 static unsigned g_speedTick = 0;
 static unsigned g_deviceCount = 0;
 static std::atomic<bool> g_printRun{false};
@@ -135,6 +136,13 @@ static std::string formatRate(double hps) {
 
 static void printLoop() {
     const uint64_t watchdogMs = 10000; // 10s without updates => mark as stalled
+    std::vector<uint64_t> prevProcessed;
+    std::vector<uint64_t> prevTimeMs;
+    {
+        std::lock_guard<std::mutex> lk(g_speedMutex);
+        prevProcessed.assign(g_deviceCount, 0);
+        prevTimeMs.assign(g_deviceCount, 0);
+    }
     while (g_printRun.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
         double total = 0.0;
@@ -145,7 +153,16 @@ static void printLoop() {
         {
             std::lock_guard<std::mutex> lk(g_speedMutex);
             for (unsigned i = 0; i < g_deviceCount; ++i) {
-                double s = g_gpuSpeeds[i];
+                // Compute instantaneous H/s from processed deltas over wall-clock
+                uint64_t p = g_gpuProcessed[i];
+                uint64_t dt = (prevTimeMs[i] == 0) ? 0 : (now - prevTimeMs[i]);
+                double inst = (dt > 0) ? (double)(p - prevProcessed[i]) * 1000.0 / (double)dt : 0.0;
+                // Low-pass filter (EMA) to reduce jitter
+                double s = (g_gpuSpeeds[i] == 0.0) ? inst : (0.3 * inst + 0.7 * g_gpuSpeeds[i]);
+                g_gpuSpeeds[i] = s;
+                prevProcessed[i] = p;
+                prevTimeMs[i] = now;
+
                 double shown = (s > 0.0 ? s : g_gpuLastNonZero[i]);
                 total += shown;
                 bool stalled = (now > g_gpuLastUpdateMs[i]) && (now - g_gpuLastUpdateMs[i] > watchdogMs);
@@ -233,12 +250,12 @@ static void deviceThread(DeviceCtx ctx) {
         ++ctx.rounds;
 
         // Update per-GPU speed (H/s)
-        ctx.speed.sample(static_cast<double>(ctx.sizeTotal));
         {
             std::lock_guard<std::mutex> lk(g_speedMutex);
-            const double v = ctx.speed.getSpeed();
-            g_gpuSpeeds[ctx.index] = v;
-            if (v > 0.0) g_gpuLastNonZero[ctx.index] = v;
+            g_gpuProcessed[ctx.index] += ctx.sizeTotal;
+            // Mark recent activity for watchdog and keep last non-zero displayable rate
+            // We'll compute speeds in the printer thread.
+            if (g_gpuSpeeds[ctx.index] > 0.0) g_gpuLastNonZero[ctx.index] = g_gpuSpeeds[ctx.index];
             g_gpuLastUpdateMs[ctx.index] = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         }
@@ -332,6 +349,7 @@ int main(int argc, char **argv) {
         g_gpuSpeeds.assign(g_deviceCount, 0.0);
         g_gpuLastNonZero.assign(g_deviceCount, 0.0);
         g_gpuLastUpdateMs.assign(g_deviceCount, 0);
+        g_gpuProcessed.assign(g_deviceCount, 0);
 
         const uint32_t invSize = (uint32_t)std::min<size_t>(inverseSize, 255);
         const uint32_t sizeTotal = (uint32_t)std::min<size_t>(worksizeMax == 0 ? inverseSize * inverseMultiple : worksizeMax, 0xFFFFFFFFu);
