@@ -10,9 +10,9 @@
 #include <atomic>
 #include <chrono>
 #include <algorithm>
-#include <iomanip>
 #include <cstring>
 #include <cstdint>
+#include <iomanip>
 
 #include "ArgParser.hpp"
 #include "Mode.hpp"
@@ -22,8 +22,7 @@
 
 // Kernel prototypes (defined in cuda_kernels.cu)
 extern "C" {
-struct ulong4 { uint64_t x, y, z, w; };
-__global__ void profanity_init(const point *precomp, mp_number *pDeltaX, mp_number *pPrevLambda, result *pResult, ulong4 seed, ulong4 seedX, ulong4 seedY, uint32_t sizeTotal, uint32_t inverseSize);
+__global__ void profanity_init(const point *precomp, mp_number *pDeltaX, mp_number *pPrevLambda, result *pResult, ulonglong4 seed, ulonglong4 seedX, ulonglong4 seedY, uint32_t sizeTotal, uint32_t inverseSize);
 __global__ void profanity_inverse(const mp_number *pDeltaX, mp_number *pInverse, uint32_t sizeTotal, uint32_t inverseSize);
 __global__ void profanity_iterate(mp_number *pDeltaX, mp_number *pInverse, mp_number *pPrevLambda, uint32_t sizeTotal);
 __global__ void profanity_transform_contract(mp_number *pInverse, uint32_t sizeTotal);
@@ -36,6 +35,8 @@ __global__ void profanity_score_leadingrange(mp_number *pInverse, result *pResul
 __global__ void profanity_score_mirror(mp_number *pInverse, result *pResult, const uint8_t *data1, const uint8_t *data2, uint8_t scoreMax, uint32_t sizeTotal);
 __global__ void profanity_score_doubles(mp_number *pInverse, result *pResult, const uint8_t *data1, const uint8_t *data2, uint8_t scoreMax, uint32_t sizeTotal);
 }
+
+static constexpr int PROFANITY_MAX_SCORE = 40;
 
 static bool get_secure_random_bytes(void *dst, size_t n) {
     std::ifstream ur("/dev/urandom", std::ios::binary);
@@ -61,7 +62,7 @@ static std::string::size_type fromHex(char c) {
     return hex.find(c);
 }
 
-static ulong4 fromHexPK(const std::string &strHex) {
+static ulonglong4 fromHexPK(const std::string &strHex) {
     uint8_t data[32] = {0};
     size_t index = 0;
     for (size_t i = 0; i < strHex.size(); i += 2) {
@@ -70,8 +71,7 @@ static ulong4 fromHexPK(const std::string &strHex) {
         uint8_t val = ((hi == std::string::npos) ? 0 : (uint8_t)(hi << 4)) | ((lo == std::string::npos) ? 0 : (uint8_t)lo);
         if (index < 32) data[index++] = val;
     }
-    ulong4 out;
-    // Big endian to uint64_t words, then to host endianness
+    ulonglong4 out;
     out.x = bswap64(*(uint64_t*)(data + 24));
     out.y = bswap64(*(uint64_t*)(data + 16));
     out.z = bswap64(*(uint64_t*)(data + 8));
@@ -87,16 +87,17 @@ static std::string toHex(const uint8_t *s, size_t len) {
 }
 
 struct DeviceCtx {
-    int devId;
-    uint32_t index;
-    uint32_t worksizeLocal; // not used in CUDA path, kept for parity
-    uint32_t inverseSize;
-    uint32_t sizeTotal;
+    explicit DeviceCtx(const Mode &m) : mode(m) {}
+    int devId = 0;
+    uint32_t index = 0;
+    uint32_t worksizeLocal = 256; // unused in CUDA path
+    uint32_t inverseSize = 255;
+    uint32_t sizeTotal = 0;
     Mode mode;
-    ulong4 seed;
-    ulong4 seedX;
-    ulong4 seedY;
-    cudaStream_t stream;
+    ulonglong4 seed{};
+    ulonglong4 seedX{};
+    ulonglong4 seedY{};
+    cudaStream_t stream = nullptr;
     point *d_precomp = nullptr;
     mp_number *d_deltaX = nullptr;
     mp_number *d_inverse = nullptr;
@@ -114,9 +115,8 @@ static std::mutex g_printMutex;
 static std::atomic<uint8_t> g_globalScoreMax{0};
 static std::atomic<bool> g_quit{false};
 
-static void printFinding(const ulong4 &seed, uint64_t round, const result &r, uint8_t score, const std::chrono::time_point<std::chrono::steady_clock> &timeStart, const Mode &mode) {
+static void printFinding(const ulonglong4 &seed, uint64_t round, const result &r, uint8_t score, const std::chrono::time_point<std::chrono::steady_clock> &timeStart, const Mode &mode) {
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - timeStart).count();
-    // Compose private key estimate (seed + round + foundId). This mirrors OpenCL's print.
     uint64_t s0 = seed.x + round; uint64_t carry = (s0 < seed.x) ? 1 : 0;
     uint64_t s1 = seed.y + carry; carry = (s1 < carry) ? 1 : 0;
     uint64_t s2 = seed.z + carry; carry = (s2 < carry) ? 1 : 0;
@@ -276,15 +276,15 @@ int main(int argc, char **argv) {
         const uint32_t invSize = (uint32_t)std::min<size_t>(inverseSize, 255);
         const uint32_t sizeTotal = (uint32_t)std::min<size_t>(worksizeMax == 0 ? inverseSize * inverseMultiple : worksizeMax, 0xFFFFFFFFu);
 
-        // Seeds
-        ulong4 seedX = fromHexPK(strPublicKey.substr(0, 64));
-        ulong4 seedY = fromHexPK(strPublicKey.substr(64, 64));
+        // Seeds derived from provided public key (X/Y) + secure per-device base seed
+        ulonglong4 seedX = fromHexPK(strPublicKey.substr(0, 64));
+        ulonglong4 seedY = fromHexPK(strPublicKey.substr(64, 64));
 
         std::vector<std::thread> threads;
         uint32_t index = 0;
         for (int dev : devices) {
-            DeviceCtx ctx{}; ctx.devId = dev; ctx.index = index++; ctx.worksizeLocal = worksizeLocal; ctx.inverseSize = invSize; ctx.sizeTotal = sizeTotal; ctx.mode = mode; ctx.seedX = seedX; ctx.seedY = seedY;
-            // Secure, independent 256-bit seed per device
+            DeviceCtx ctx(mode);
+            ctx.devId = dev; ctx.index = index++; ctx.worksizeLocal = worksizeLocal; ctx.inverseSize = invSize; ctx.sizeTotal = sizeTotal; ctx.seedX = seedX; ctx.seedY = seedY;
             if (!get_secure_random_bytes(&ctx.seed, sizeof(ctx.seed))) { std::cerr << "error: failed to get secure random seed" << std::endl; return 1; }
             threads.emplace_back(deviceThread, ctx);
         }
@@ -297,7 +297,6 @@ int main(int argc, char **argv) {
         std::cout << "  improve overall performance." << std::endl;
         std::cout << std::endl;
 
-        // Wait for workers (Ctrl-C to stop)
         for (auto &t : threads) t.join();
         return 0;
     } catch (std::runtime_error &e) {
@@ -306,4 +305,4 @@ int main(int argc, char **argv) {
         std::cout << "unknown exception occurred" << std::endl; return 1;
     }
 }
-static constexpr int PROFANITY_MAX_SCORE = 40;
+

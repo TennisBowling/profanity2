@@ -27,11 +27,16 @@ clean:
 	rm -rf *.o
 
 # CUDA build (optional)
-CUDA_SOURCES=profanity_cuda.cpp Mode.cpp precomp.cpp
-CUDA_OBJECTS=$(CUDA_SOURCES:.cpp=.cuo)
+CUDA_HOST_SOURCES=Mode.cpp precomp.cpp
+CUDA_DEVICE_SOURCES=profanity_cuda.cu cuda_kernels.cu
+CUDA_OBJECTS_HOST=$(CUDA_HOST_SOURCES:.cpp=.o)
+CUDA_OBJECTS_DEVICE=$(CUDA_DEVICE_SOURCES:.cu=.o)
 
-$(EXECUTABLE_CUDA): $(CUDA_OBJECTS) cuda_kernels.cu
-	$(NVCC) -O3 -std=c++14 -Xcompiler -fPIC -o $@ $(CUDA_OBJECTS) cuda_kernels.cu
+$(EXECUTABLE_CUDA): $(CUDA_OBJECTS_HOST) $(CUDA_OBJECTS_DEVICE)
+	$(NVCC) -O3 -std=c++14 -o $@ $(CUDA_OBJECTS_HOST) $(CUDA_OBJECTS_DEVICE)
 
-%.cuo: %.cpp
+%.o: %.cpp
+	$(NVCC) -O3 -std=c++14 -c $< -o $@
+
+%.o: %.cu
 	$(NVCC) -O3 -std=c++14 -c $< -o $@

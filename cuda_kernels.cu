@@ -12,7 +12,6 @@ typedef uint32_t mp_word;
 struct mp_number { mp_word d[8]; };
 struct point { mp_number x; mp_number y; };
 struct result { uint32_t found; uint32_t foundId; uint8_t foundHash[20]; };
-struct ulong4 { uint64_t x, y, z, w; };
 
 #define MP_WORDS 8
 #define PROFANITY_MAX_INVERSE_SIZE 255
@@ -314,7 +313,7 @@ __device__ __forceinline__ void profanity_init_seed(const point *precomp, point 
 }
 
 // ----------------- kernels -----------------
-__global__ void profanity_init(const point *precomp, mp_number *pDeltaX, mp_number *pPrevLambda, result *pResult, ulong4 seed, ulong4 seedX, ulong4 seedY, uint32_t sizeTotal, uint32_t inverseSize) {
+__global__ void profanity_init(const point *precomp, mp_number *pDeltaX, mp_number *pPrevLambda, result *pResult, ulonglong4 seed, ulonglong4 seedX, ulonglong4 seedY, uint32_t sizeTotal, uint32_t inverseSize) {
     const uint32_t id = blockIdx.x * blockDim.x + threadIdx.x;
     if (id >= sizeTotal) return;
     point p;
