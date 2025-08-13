@@ -1,21 +1,20 @@
 #ifndef HPP_TYPES
 #define HPP_TYPES
 
-/* The structs declared in this file should have size/alignment hints
- * to ensure that their representation is identical to that in OpenCL.
+/* Types used for host-side buffers exchanged with GPU code.
+ * These are defined in terms of fixed-width integers to avoid
+ * coupling to any specific GPU host API headers. The layouts
+ * must remain identical to the corresponding types in kernels.
  */
-#if defined(__APPLE__) || defined(__MACOSX)
-#include <OpenCL/cl.h>
-#else
-#include <CL/cl.h>
-#endif
+
+#include <cstdint>
 
 #define MP_NWORDS 8
 
-typedef cl_uint mp_word;
+typedef uint32_t mp_word;
 
 typedef struct {
-	mp_word d[MP_NWORDS];
+    mp_word d[MP_NWORDS];
 } mp_number;
 
 typedef struct {
@@ -24,9 +23,9 @@ typedef struct {
 } point;
 
 typedef struct {
-	cl_uint found;
-	cl_uint foundId;
-	cl_uchar foundHash[20];
+    uint32_t found;
+    uint32_t foundId;
+    uint8_t  foundHash[20];
 } result;
 
 #endif /* HPP_TYPES */
