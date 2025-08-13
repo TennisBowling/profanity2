@@ -118,8 +118,45 @@ static std::atomic<uint8_t> g_globalScoreMax{0};
 static std::atomic<bool> g_quit{false};
 static std::mutex g_speedMutex;
 static std::vector<double> g_gpuSpeeds;
+static std::vector<double> g_gpuLastNonZero;
+static std::vector<uint64_t> g_gpuLastUpdateMs;
 static unsigned g_speedTick = 0;
 static unsigned g_deviceCount = 0;
+static std::atomic<bool> g_printRun{false};
+
+static std::string formatRate(double hps) {
+    std::ostringstream os; os.setf(std::ios::fixed);
+    if (hps >= 1e9) { os << std::setprecision(2) << (hps / 1e9) << " GH/s"; }
+    else if (hps >= 1e6) { os << std::setprecision(1) << (hps / 1e6) << " MH/s"; }
+    else if (hps >= 1e3) { os << std::setprecision(1) << (hps / 1e3) << " kH/s"; }
+    else { os << std::setprecision(0) << hps << " H/s"; }
+    return os.str();
+}
+
+static void printLoop() {
+    const uint64_t watchdogMs = 10000; // 10s without updates => mark as stalled
+    while (g_printRun.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        double total = 0.0;
+        std::ostringstream ss;
+        ss.setf(std::ios::fixed);
+        uint64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        {
+            std::lock_guard<std::mutex> lk(g_speedMutex);
+            for (unsigned i = 0; i < g_deviceCount; ++i) {
+                double s = g_gpuSpeeds[i];
+                double shown = (s > 0.0 ? s : g_gpuLastNonZero[i]);
+                total += shown;
+                bool stalled = (now > g_gpuLastUpdateMs[i]) && (now - g_gpuLastUpdateMs[i] > watchdogMs);
+                ss << " GPU" << i << ": " << formatRate(shown);
+                if (stalled) ss << " (stalled)";
+            }
+        }
+        std::lock_guard<std::mutex> pk(g_printMutex);
+        std::cout << "\33[2K\r  Total: " << formatRate(total) << ss.str() << std::flush;
+    }
+}
 
 static void printFinding(int gpuIndex, const ulonglong4 &seed, uint64_t round, const result &r, uint8_t score, const std::chrono::time_point<std::chrono::steady_clock> &timeStart, const Mode &mode) {
     const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - timeStart).count();
@@ -195,25 +232,15 @@ static void deviceThread(DeviceCtx ctx) {
         cudaStreamSynchronize(ctx.stream);
         ++ctx.rounds;
 
-        // Update per-GPU speed and print totals periodically
+        // Update per-GPU speed (H/s)
         ctx.speed.sample(static_cast<double>(ctx.sizeTotal));
         {
             std::lock_guard<std::mutex> lk(g_speedMutex);
-            g_gpuSpeeds[ctx.index] = ctx.speed.getSpeed();
-            if (++g_speedTick >= g_deviceCount) {
-                g_speedTick = 0;
-                double total = 0.0;
-                std::ostringstream ss;
-                ss.setf(std::ios::fixed); ss << std::setprecision(1);
-                for (unsigned i = 0; i < g_deviceCount; ++i) {
-                    double mh = g_gpuSpeeds[i] / 1e6;
-                    total += g_gpuSpeeds[i];
-                    ss << " GPU" << i << ": " << mh << " MH/s";
-                }
-                double mht = total / 1e6;
-                std::lock_guard<std::mutex> pk(g_printMutex);
-                std::cout << "\33[2K\r  Total: " << std::setprecision(1) << mht << " MH/s" << ss.str() << std::flush;
-            }
+            const double v = ctx.speed.getSpeed();
+            g_gpuSpeeds[ctx.index] = v;
+            if (v > 0.0) g_gpuLastNonZero[ctx.index] = v;
+            g_gpuLastUpdateMs[ctx.index] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
         }
 
         for (int i = PROFANITY_MAX_SCORE; i > ctx.localScoreMax; --i) {
@@ -303,6 +330,8 @@ int main(int argc, char **argv) {
 
         g_deviceCount = static_cast<unsigned>(devices.size());
         g_gpuSpeeds.assign(g_deviceCount, 0.0);
+        g_gpuLastNonZero.assign(g_deviceCount, 0.0);
+        g_gpuLastUpdateMs.assign(g_deviceCount, 0);
 
         const uint32_t invSize = (uint32_t)std::min<size_t>(inverseSize, 255);
         const uint32_t sizeTotal = (uint32_t)std::min<size_t>(worksizeMax == 0 ? inverseSize * inverseMultiple : worksizeMax, 0xFFFFFFFFu);
@@ -312,6 +341,7 @@ int main(int argc, char **argv) {
         ulonglong4 seedY = fromHexPK(strPublicKey.substr(64, 64));
 
         std::vector<std::thread> threads;
+        std::thread printer;
         uint32_t index = 0;
         for (int dev : devices) {
             DeviceCtx ctx(mode);
@@ -319,6 +349,10 @@ int main(int argc, char **argv) {
             if (!get_secure_random_bytes(&ctx.seed, sizeof(ctx.seed))) { std::cerr << "error: failed to get secure random seed" << std::endl; return 1; }
             threads.emplace_back(deviceThread, ctx);
         }
+
+        // Start periodic printer
+        g_printRun.store(true);
+        printer = std::thread(printLoop);
 
         std::cout << std::endl;
         std::cout << "Running..." << std::endl;
@@ -329,6 +363,8 @@ int main(int argc, char **argv) {
         std::cout << std::endl;
 
         for (auto &t : threads) t.join();
+        g_printRun.store(false);
+        if (printer.joinable()) printer.join();
         return 0;
     } catch (std::runtime_error &e) {
         std::cout << "std::runtime_error - " << e.what() << std::endl; return 1;
